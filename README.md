@@ -58,12 +58,6 @@ All scripts are designed for Linux desktops running X11 / Cinnamon (Linux Mint).
 - `ffmpeg` — audio/video recording
 - `libnotify-bin` — notifications
 
-## Structure
-
-Each zip archive contains:
-- The shell script (`.sh`)
-- A `README.md` with full usage instructions and dependency list
-
 ## License
 
 Feel free to use these scripts as you wish.

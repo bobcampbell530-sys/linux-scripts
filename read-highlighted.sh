@@ -1,0 +1,1 @@
+/home/bob/bin/utils/read-highlighted.sh
