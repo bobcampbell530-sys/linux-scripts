@@ -263,6 +263,27 @@
       </div>
     </div>
 
+    <div class="section" id="systemp">
+      <h2>🌡️ sys-temp.sh — Temperature Monitor</h2>
+      <p>Monitor CPU package, per-core, and motherboard temperatures in real time. Auto-detects Intel (coretemp) and AMD (k10temp) processors.</p>
+      <ul class="features">
+        <li>Live terminal display with aligned table format</li>
+        <li>CSV logging to <code>~/temp_log.csv</code> for spreadsheet analysis</li>
+        <li>Per-core tracking on Intel CPUs</li>
+        <li>Auto-detected motherboard (acpitz) temps</li>
+        <li>CPU utilization percentage alongside temperatures</li>
+        <li>Summary report with min/max/average on Ctrl+C</li>
+        <li>Optional warning threshold via <code>--warn</code></li>
+      </ul>
+      <div class="callout">
+        <p><strong>Usage:</strong> <code>sys-temp.sh --interactive 2</code> for live display every 2 seconds, or <code>sys-temp.sh --csv</code> to log to CSV.</p>
+      </div>
+      <div class="requirements">
+        <h3>Requirements</h3>
+        <p><code>lm-sensors</code> (install with <code>sudo apt install lm-sensors</code>)</p>
+      </div>
+    </div>
+
   </div>
 
 </body>
