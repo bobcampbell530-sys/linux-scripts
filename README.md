@@ -1,63 +1,44 @@
-# linux-scripts
+# Linux Scripts
 
-A collection of Linux desktop utility scripts for Mint X11 / Cinnamon.
+A collection of shell scripts and Python GUI applications for Linux Mint / Cinnamon desktops.
+
+## Launcher
+
+Run `video-tools` to launch a menu-based interface for all 4 video editing tools at once.
 
 ## Tools
 
-### QuickVid_v7.sh — Screen Video Recorder
+### Shell Scripts
 
-Record any area of your screen in MP4 format with optional audio (system, microphone, or headphones) and timer support. Select a draggable region on screen, choose your audio source, and hit record.
+| Script | Description |
+|--------|-------------|
+| [read-highlighted.sh](read-highlighted.sh) | Read highlighted text aloud using Piper TTS |
+| [quickaudio_v3.sh](quickaudio_v3.sh) | Record system audio, microphone, or mix as MP3 |
+| [QuickVid_v7.sh](QuickVid_v7.sh) | Record screen video with optional audio |
+| [launcher_v3.sh](launcher_v3.sh) | Create desktop launchers for any script |
+| [ImageClipper.sh](ImageClipper.sh) | Screenshot tool with clipboard/file output |
+| [ocr_multi.sh](ocr_multi.sh) | OCR text from screen region |
+| [sys-temp.sh](sys-temp.sh) | Monitor CPU temperatures in real time |
 
-- Draggable area selection with crosshair cursor
-- 30 FPS H.264 video encoding
-- Optional system audio, microphone, or Bluetooth headphone capture
-- Timer support and PID-based toggle (run again to stop)
-- Outputs to `~/Videos/`
+### Video Editing Tools (Python + Tkinter)
 
-### ImageClipper.sh — Screenshot Tool
+| Script | Description |
+|--------|-------------|
+| [video-cutter](video-cutter) | Cut out unwanted sections from video files |
+| [video-joiner](video-joiner) | Join multiple videos into one |
+| [video-resizer](video-resizer) | Batch reduce file sizes for all videos in a directory |
+| [video-speeder](video-speeder) | Change playback speed (25%–200%) with natural audio |
 
-Capture a selected screen region and save as PNG — either to the clipboard (paste-ready) or to either a named file or a timestamped file.
-
-- Region selection with crosshair cursor
-- Clipboard or file output
-- Notification confirmation
-- Outputs to clipboard or `~/Pictures/Screenshots/`
-
-### ocr_multi.sh — Screen OCR
-
-Capture a screen region and extract text using Tesseract OCR. Supports English, Spanish, French, German, Italian, and Portuguese alphabet letters. The result is copied to the clipboard automatically.
-
-- Region selection
-- Multi-language support
-- Clipboard output
-- Great for extracting text from images or documents on screen
-
-### quickaudio_v3.sh — Audio Recorder
-
-Record system audio, microphone, or a mix as MP3 files. Choose your source, set a timer if desired, and start recording. Run the script again to stop.
-
-- System audio, microphone, or mixed input
-- Optional timer
-- Custom or auto-named files
-- Outputs to `~/Video/Audio/`
-
-### launcher_v3.sh — Launcher Manager
-
-Create, edit, and delete `.desktop` launchers for any executable script. Build launchers step-by-step, assign icons, and place them on your desktop or application menu.
-
-- Create launchers from `.sh`, `.py`, `.bash`, `.pl`, `.js`, `.rb`, `.perl`, `.lua`, `.tcl` scripts
-- Edit or delete existing launchers
-- Custom icons and descriptions
-- Symlinks in `~/bin/` and `.desktop` files in `~/.local/share/applications/`
+Run `video-tools` for a unified menu launcher.
 
 ## Requirements
 
-All scripts are designed for Linux desktops running X11 / Cinnamon (Linux Mint). Each tool lists its own dependencies in the included `README.md` file inside the zip archive. Common dependencies include:
+- **Linux**: `ffmpeg` + `ffprobe` (for video tools), `python3` with `tkinter`
+- **macOS**: `brew install ffmpeg` and `bash video-tools.sh` (macOS ships with bash 3.2 by default, which lacks associative array support)
+- **Windows**: Not natively supported — use WSL2
 
-- `zenity` — GUI dialogs
-- `ffmpeg` — audio/video recording
-- `libnotify-bin` — notifications
+## Notes
 
-## License
-
-Feel free to use these scripts as you wish.
+- All video tools leave the original file unmodified.
+- Video tools use FFmpeg under the hood — re-encode with quality presets to control output size.
+- Shell scripts are designed for Linux Mint / Cinnamon desktop environments.
