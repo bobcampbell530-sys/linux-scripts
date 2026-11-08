@@ -1,0 +1,740 @@
+#!/usr/bin/env python3
+"""
+Video Joiner - Join multiple video files into one.
+
+Cross-platform (Windows, macOS, Linux). Re-encodes each file to fix
+timestamps/keyframes, then concatenates the clean files.
+
+Files are joined in the order they appear in the list. Use Up/Down
+to reorder before joining.
+"""
+
+import os
+import queue
+import shutil
+import subprocess
+import tempfile
+import threading
+import tkinter as tk
+from datetime import datetime
+from pathlib import Path
+from tkinter import messagebox, ttk
+
+
+VIDEO_EXTENSIONS = {
+    '.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm',
+    '.m4v', '.mpg', '.mpeg', '.3gp', '.ogv', '.ts'
+}
+
+
+def find_program(name):
+    """Return the executable path, or None if not on PATH."""
+    return shutil.which(name)
+
+
+def get_video_duration(filepath):
+    """Return video duration in seconds, or 0."""
+    cmd = [
+        find_program('ffprobe') or 'ffprobe',
+        '-v', 'error',
+        '-show_entries', 'format=duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1',
+        str(filepath),
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=True, timeout=30
+        )
+        return float(result.stdout.strip())
+    except (subprocess.SubprocessError, ValueError, OSError):
+        return 0.0
+
+
+def has_audio_stream(filepath):
+    """Return True if the file has an audio stream."""
+    cmd = [
+        find_program('ffprobe') or 'ffprobe',
+        '-v', 'error',
+        '-select_streams', 'a',
+        '-show_entries', 'stream=codec_type',
+        '-of', 'csv=p=0',
+        str(filepath),
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=True, timeout=10
+        )
+        return bool(result.stdout.strip())
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+def get_desktop_directory():
+    """Return Desktop directory, or home if it doesn't exist."""
+    home = Path.home()
+    desktop = home / 'Desktop'
+    return desktop if desktop.is_dir() else home
+
+
+class FileBrowserPanel(ttk.Frame):
+    """Built-in file browser — embedded in the main window."""
+
+    def __init__(self, parent, on_select=None):
+        super().__init__(parent, padding=5)
+        self.on_select = on_select
+        self.current_dir = Path.home()
+        self.item_paths = {}
+        self._build_ui()
+        self._refresh()
+
+    def _build_ui(self):
+        # --- Navigation bar ---
+        nav = ttk.Frame(self)
+        nav.pack(fill='x')
+
+        ttk.Button(nav, text='↑ Up', command=self._go_up, width=6).pack(
+            side='left', padx=1
+        )
+        ttk.Button(nav, text='Home', command=self._go_home, width=6).pack(
+            side='left', padx=1
+        )
+        ttk.Button(
+            nav, text='Desktop',
+            command=lambda: self._navigate(get_desktop_directory()), width=8
+        ).pack(side='left', padx=1)
+
+        self.path_var = tk.StringVar(value=str(self.current_dir))
+        ttk.Entry(nav, textvariable=self.path_var).pack(
+            side='left', fill='x', expand=True, padx=3
+        )
+        ttk.Button(nav, text='Go', command=self._go_click, width=4).pack(
+            side='left'
+        )
+
+        ttk.Label(nav, text='Filter:').pack(side='right', padx=(5, 2))
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add('write', lambda *_: self._refresh())
+        ttk.Entry(nav, textvariable=self.filter_var, width=15).pack(side='right')
+
+        # --- Quick-access bar ---
+        qa = ttk.Frame(self)
+        qa.pack(fill='x')
+        ttk.Label(qa, text='Quick:').pack(side='left')
+        for label, folder in (
+            ('Home', Path.home()),
+            ('Videos', Path.home() / 'Videos'),
+            ('Downloads', Path.home() / 'Downloads'),
+        ):
+            ttk.Button(
+                qa, text=label,
+                command=lambda p=folder: self._navigate(p), width=9
+            ).pack(side='left', padx=1)
+
+        # --- Tree ---
+        tree_frame = ttk.Frame(self)
+        tree_frame.pack(fill='both', expand=True, pady=3)
+
+        vertical = ttk.Scrollbar(tree_frame)
+        vertical.pack(side='right', fill='y')
+        horizontal = ttk.Scrollbar(tree_frame, orient='horizontal')
+        horizontal.pack(side='bottom', fill='x')
+
+        self.tree = ttk.Treeview(
+            tree_frame,
+            columns=('size', 'modified'),
+            show='headings',
+            yscrollcommand=vertical.set,
+            xscrollcommand=horizontal.set,
+            height=14,
+        )
+        self.tree.pack(fill='both', expand=True)
+        vertical.config(command=self.tree.yview)
+        horizontal.config(command=self.tree.xview)
+
+        self.tree.heading('#0', text='Name')
+        self.tree.heading('size', text='Size')
+        self.tree.heading('modified', text='Modified')
+        self.tree.column('#0', width=440, minwidth=180)
+        self.tree.column('size', width=100)
+        self.tree.column('modified', width=160)
+
+        self.tree.bind('<Double-1>', self._on_double)
+        self.tree.bind('<Return>', self._on_double)
+
+        self.status = ttk.Label(self, text='Ready')
+        self.status.pack(fill='x', pady=(2, 0))
+
+    def _refresh(self):
+        self.tree.delete(*self.tree.get_children())
+        self.item_paths.clear()
+
+        if not self.current_dir.is_dir():
+            self.current_dir = Path.home()
+
+        self.path_var.set(str(self.current_dir))
+        filter_text = self.filter_var.get().strip().casefold()
+
+        try:
+            directories = []
+            files = []
+
+            with os.scandir(self.current_dir) as entries:
+                for entry in entries:
+                    if entry.name.startswith('.'):
+                        continue
+                    if filter_text and filter_text not in entry.name.casefold():
+                        continue
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            directories.append(entry)
+                        else:
+                            files.append(entry)
+                    except OSError:
+                        continue
+
+            directories.sort(key=lambda item: item.name.casefold())
+            files.sort(key=lambda item: item.name.casefold())
+
+            for entry in directories + files:
+                path = Path(entry.path)
+                is_dir = entry.is_dir(follow_symlinks=False)
+
+                if is_dir:
+                    display_name = f'[Folder] {entry.name}'
+                    size_text = '—'
+                    modified_text = '—'
+                else:
+                    extension = path.suffix.lower()
+                    prefix = '[Video] ' if extension in VIDEO_EXTENSIONS else ''
+                    display_name = prefix + entry.name
+                    try:
+                        stat = entry.stat()
+                        size_text = f'{stat.st_size / (1024 * 1024):.1f} MB'
+                        modified_text = datetime.fromtimestamp(
+                            stat.st_mtime
+                        ).strftime('%Y-%m-%d %H:%M')
+                    except OSError:
+                        size_text = '?'
+                        modified_text = '?'
+
+                item_id = self.tree.insert(
+                    '', 'end',
+                    values=(display_name, size_text, modified_text)
+                )
+                self.item_paths[item_id] = path
+
+            total = len(directories) + len(files)
+            self.status.config(text=f'{total} items  |  {self.current_dir}')
+
+        except (PermissionError, OSError) as error:
+            self.status.config(text=f'Cannot read folder: {error}')
+
+    def _on_double(self, _event=None):
+        selection = self.tree.selection()
+        if not selection:
+            return
+
+        path = self.item_paths.get(selection[0])
+        if not path:
+            return
+
+        if path.is_dir():
+            self._navigate(path)
+        elif path.suffix.lower() in VIDEO_EXTENSIONS:
+            if self.on_select:
+                self.on_select(path)
+
+    def _navigate(self, path):
+        candidate = Path(os.path.expandvars(os.path.expanduser(str(path))))
+        if candidate.is_dir():
+            self.current_dir = candidate.resolve()
+            self._refresh()
+        else:
+            messagebox.showwarning(
+                'Folder not found',
+                f'This folder does not exist:\n{candidate}',
+            )
+
+    def _go_up(self):
+        parent = self.current_dir.parent
+        if parent != self.current_dir:
+            self._navigate(parent)
+
+    def _go_home(self):
+        self._navigate(Path.home())
+
+    def _go_click(self):
+        value = self.path_var.get().strip()
+        if value:
+            self._navigate(value)
+
+
+class VideoJoinerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title('Video Joiner')
+        self.root.geometry('850x1050')
+        self.root.minsize(700, 1000)
+        self.root.resizable(True, True)
+
+        self.join_list = []  # list of Path objects in order
+        self.output_path = tk.StringVar()
+        self.processing = False
+        self.result_queue = queue.Queue()
+
+        self._build_ui()
+        self._check_dependencies()
+        self.root.protocol('WM_DELETE_WINDOW', self._on_close)
+
+    def _check_dependencies(self):
+        missing = [
+            name for name in ('ffmpeg', 'ffprobe') if not find_program(name)
+        ]
+        if missing:
+            messagebox.showwarning(
+                'FFmpeg required',
+                'The following required programs were not found:\n\n'
+                + '\n'.join(missing)
+                + '\n\nInstall FFmpeg and make sure it is available in PATH.',
+            )
+
+    def _build_ui(self):
+        main = ttk.Frame(self.root, padding=12)
+        main.pack(fill='both', expand=True)
+
+        ttk.Label(
+            main, text='Video Joiner', font=('TkDefaultFont', 18, 'bold')
+        ).pack(pady=(0, 10))
+
+        # === BROWSER ===
+        self.browser = FileBrowserPanel(main, on_select=self._on_video_select)
+        self.browser.pack(fill='both', expand=False, pady=(0, 8))
+
+        # === JOIN LIST ===
+        list_frame = ttk.LabelFrame(main, text='Files to Join (in order)', padding=8)
+        list_frame.pack(fill='both', expand=True, pady=(0, 8))
+
+        # Buttons row
+        list_btns = ttk.Frame(list_frame)
+        list_btns.pack(fill='x', pady=(0, 4))
+
+        ttk.Label(list_btns, text='Double-click a video above to add it.').pack(
+            side='left'
+        )
+
+        # === JOIN LIST TREE ===
+        list_scroll = ttk.Scrollbar(list_frame)
+        list_scroll.pack(side='right', fill='y')
+
+        self.join_tree = ttk.Treeview(
+            list_frame,
+            columns=('index', 'name', 'duration'),
+            show='headings',
+            yscrollcommand=list_scroll.set,
+            height=6,
+        )
+        self.join_tree.pack(fill='x', expand=False, pady=4)
+        list_scroll.config(command=self.join_tree.yview)
+
+        self.join_tree.heading('index', text='#', anchor='c')
+        self.join_tree.heading('name', text='File', anchor='w')
+        self.join_tree.heading('duration', text='Duration', anchor='e')
+
+        self.join_tree.column('index', width=40, anchor='c')
+        self.join_tree.column('name', width=400, anchor='w')
+        self.join_tree.column('duration', width=100, anchor='e')
+
+        # Up / Down buttons
+        move_btns = ttk.Frame(list_frame)
+        move_btns.pack(fill='x', pady=(4, 0))
+        ttk.Button(
+            move_btns, text='▲ Move Up', command=self._move_up
+        ).pack(side='left', expand=True, padx=3)
+        ttk.Button(
+            move_btns, text='▼ Move Down', command=self._move_down
+        ).pack(side='left', expand=True, padx=3)
+        ttk.Button(
+            move_btns, text='✕ Remove', command=self._remove_selected
+        ).pack(side='left', expand=True, padx=3)
+        ttk.Button(
+            move_btns, text='✕ Remove All', command=self._remove_all
+        ).pack(side='left', expand=True, padx=3)
+
+        # === OUTPUT ===
+        out_frame = ttk.LabelFrame(main, text='Output File', padding=8)
+        out_frame.pack(fill='x', pady=(0, 8))
+
+        out_row = ttk.Frame(out_frame)
+        out_row.pack(fill='x')
+        ttk.Label(out_row, text='Save as:').pack(side='left')
+        ttk.Entry(
+            out_row, textvariable=self.output_path, width=55
+        ).pack(side='left', padx=5, fill='x', expand=True)
+
+        # === BUTTONS ===
+        btn_frame = ttk.Frame(main)
+        btn_frame.pack(fill='x')
+        self.join_button = ttk.Button(
+            btn_frame, text='🔗 Join Videos', command=self._start_join
+        )
+        self.join_button.pack(side='left', expand=True, padx=3)
+        self.reset_button = ttk.Button(
+            btn_frame, text='Reset', command=self._reset
+        )
+        self.reset_button.pack(side='left', expand=True, padx=3)
+
+        # === PROGRESS ===
+        prog_frame = ttk.Frame(main)
+        prog_frame.pack(fill='x', pady=(5, 0))
+
+        self.progress_label = ttk.Label(prog_frame, text='')
+        self.progress_label.pack(fill='x')
+
+        self.progress = ttk.Progressbar(prog_frame, mode='indeterminate')
+        self.progress.pack(fill='x')
+
+        self.summary = ttk.Label(main, text='', wraplength=800, foreground='#336633')
+        self.summary.pack(pady=(6, 0))
+
+    def _on_video_select(self, path):
+        """Called when a video is double-clicked in the browser."""
+        path = Path(path).resolve()
+
+        if path.suffix.lower() not in VIDEO_EXTENSIONS:
+            messagebox.showwarning(
+                'Not a video',
+                f'This file type is not supported:\n{path.suffix}',
+            )
+            return
+
+        if path in [p.resolve() for p in self.join_list]:
+            messagebox.showinfo(
+                'Already added', f'"{path.name}" is already in the list.'
+            )
+            return
+
+        self.join_list.append(path)
+        # Clear browser selection so it doesn't interfere with join list
+        self.browser.tree.selection_set([])
+        self.browser.tree.focus('')
+        self._refresh_join_list()
+        self._update_output_name()
+
+    def _refresh_join_list(self):
+        """Rebuild the join list tree."""
+        self.join_tree.delete(*self.join_tree.get_children())
+
+        for i, filepath in enumerate(self.join_list, start=1):
+            name = filepath.name
+            dur = get_video_duration(filepath)
+            dur_text = f'{dur:.1f}s' if dur > 0 else '?'
+            self.join_tree.insert('', 'end', values=(
+                str(i),
+                name,
+                dur_text,
+            ))
+
+    def _move_up(self):
+        sel = self.join_tree.selection()
+        if not sel:
+            return
+        idx = self.join_tree.index(sel[0])
+        if idx == 0:
+            return
+        # Swap in the backing list
+        self.join_list[idx], self.join_list[idx - 1] = (
+            self.join_list[idx - 1],
+            self.join_list[idx],
+        )
+        self._refresh_join_list()
+        # Select the moved item
+        children = self.join_tree.get_children()
+        self.join_tree.selection_set(children[idx - 1])
+        self.join_tree.see(children[idx - 1])
+
+    def _move_down(self):
+        sel = self.join_tree.selection()
+        if not sel:
+            return
+        idx = self.join_tree.index(sel[0])
+        if idx >= len(self.join_list) - 1:
+            return
+        # Swap in the backing list
+        self.join_list[idx], self.join_list[idx + 1] = (
+            self.join_list[idx + 1],
+            self.join_list[idx],
+        )
+        self._refresh_join_list()
+        children = self.join_tree.get_children()
+        self.join_tree.selection_set(children[idx + 1])
+        self.join_tree.see(children[idx + 1])
+
+    def _remove_selected(self):
+        sel = self.join_tree.selection()
+        if not sel:
+            return
+        idx = self.join_tree.index(sel[0])
+        del self.join_list[idx]
+        self._refresh_join_list()
+        self._update_output_name()
+
+    def _remove_all(self):
+        if self.join_list:
+            self.join_list.clear()
+            self._refresh_join_list()
+            self._update_output_name()
+
+    def _update_output_name(self):
+        """Generate a default output filename based on the first file."""
+        if self.join_list:
+            base = self.join_list[0].stem
+            suffix = '_joined'
+            ext = self.join_list[0].suffix
+            self.output_path.set(str(self.join_list[0].with_name(base + suffix + ext)))
+        else:
+            self.output_path.set('')
+
+    def _start_join(self):
+        if self.processing:
+            messagebox.showinfo('Info', 'Already joining videos. Wait for it to finish.')
+            return
+
+        if len(self.join_list) < 2:
+            messagebox.showerror(
+                'Not enough files',
+                f'You need at least 2 videos to join.\n\nCurrent list has {len(self.join_list)} video(s).',
+            )
+            return
+
+        output = self.output_path.get().strip()
+        if not output:
+            messagebox.showerror('Error', 'Specify an output filename.')
+            return
+
+        output_path = Path(output)
+        if output_path.exists():
+            if not messagebox.askyesno(
+                'Overwrite',
+                f'Output file already exists:\n{output_path}\n\nOverwrite?',
+            ):
+                return
+
+        reply = messagebox.askyesno(
+            'Confirm',
+            f'Join {len(self.join_list)} videos?\n\n'
+            + '\n'.join(f'  {i+1}. {p.name}' for i, p in enumerate(self.join_list))
+            + f'\n\nOutput: {output_path}\n\n'
+            + 'This will re-encode all files (a few minutes), then combine them.\n'
+            + 'Original files are NOT modified.',
+        )
+        if not reply:
+            return
+
+        self.processing = True
+        self.join_button.config(state='disabled')
+        self.reset_button.config(state='disabled')
+        self.progress.start(12)
+        self.progress_label.config(text='Preparing…')
+        self.summary.config(text='')
+
+        # Pass a snapshot of the list
+        snapshot = list(self.join_list)
+        worker = threading.Thread(
+            target=self._worker,
+            args=(snapshot, output_path),
+            daemon=True,
+        )
+        worker.start()
+        self.root.after(100, self._check_worker_result)
+
+    def _worker(self, file_list, output_path):
+        """Worker thread: re-encode each file, then concat."""
+        try:
+            ffmpeg = find_program('ffmpeg')
+            if not ffmpeg:
+                self.result_queue.put(
+                    ('error', 'FFmpeg was not found. Install it and try again.')
+                )
+                return
+
+            ffprobe = find_program('ffprobe')
+            if not ffprobe:
+                self.result_queue.put(
+                    ('error', 'FFprobe was not found. Install it and try again.')
+                )
+                return
+
+            total = len(file_list)
+            clean_files = []
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmpdir = Path(tmpdir)
+                has_any_audio = False
+
+                # Re-encode each file
+                for i, filepath in enumerate(file_list):
+                    self.root.after(
+                        0,
+                        self._update_progress,
+                        i,
+                        total,
+                        f'Re-encoding {i+1}/{total}: {filepath.name}',
+                    )
+
+                    if not filepath.exists():
+                        self.result_queue.put(
+                            ('error',
+                             f'Source file does not exist:\n{filepath}')
+                        )
+                        return
+
+                    has_audio = has_audio_stream(filepath)
+                    if has_audio:
+                        has_any_audio = True
+
+                    clean_name = f'clean_{i}.mp4'
+                    clean_path = tmpdir / clean_name
+                    clean_files.append(clean_path)
+
+                    cmd = [
+                        ffmpeg,
+                        '-y',
+                        '-i', str(filepath),
+                        '-c:v', 'libx264',
+                        '-crf', '23',
+                        '-preset', 'fast',
+                    ]
+
+                    if has_audio:
+                        cmd.extend(['-c:a', 'aac', '-b:a', '192k'])
+
+                    cmd.append(str(clean_path))
+
+                    result = subprocess.run(
+                        cmd, capture_output=True, text=True, timeout=600
+                    )
+                    if result.returncode != 0:
+                        self.result_queue.put(
+                            ('error',
+                             f'Failed to re-encode "{filepath.name}":\n'
+                             f'{(result.stderr or result.stdout or "Unknown error")[-2000:]}')
+                        )
+                        return
+
+                # Verify all clean files exist and have content
+                for cf in clean_files:
+                    if not cf.exists() or cf.stat().st_size < 1000:
+                        self.result_queue.put(
+                            ('error',
+                             f'Clean file too small or missing: {cf}')
+                        )
+                        return
+
+                # Build concat list
+                list_file = tmpdir / 'concat_list.txt'
+                with open(list_file, 'w') as f:
+                    for cf in clean_files:
+                        f.write(f"file '{cf}'\n")
+
+                self.root.after(
+                    0,
+                    self._update_progress,
+                    total,
+                    total,
+                    f'Concatenating {total} clean files…',
+                )
+
+                cmd = [
+                    ffmpeg,
+                    '-y',
+                    '-f', 'concat',
+                    '-safe', '0',
+                    '-i', str(list_file),
+                    '-c', 'copy',
+                ]
+
+                if has_any_audio:
+                    cmd.extend(['-c:a', 'aac'])
+
+                cmd.append(str(output_path))
+
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    self.result_queue.put(
+                        ('error',
+                         f'Concatenation failed:\n'
+                         f'{(result.stderr or result.stdout or "Unknown error")[-2000:]}')
+                    )
+                    return
+
+                # Verify output file
+                if not output_path.exists() or output_path.stat().st_size < 1000:
+                    self.result_queue.put(
+                        ('error',
+                         f'Output file too small or missing: {output_path}')
+                    )
+                    return
+
+                self.result_queue.put(('success', str(output_path)))
+        except Exception as e:
+            self.result_queue.put(('error', str(e)))
+
+    def _update_progress(self, index, total, text):
+        """Update progress from worker thread (must run in UI thread)."""
+        self.progress_label.config(text=text)
+        self.progress['value'] = (index / total) * 100 if total > 0 else 0
+
+    def _check_worker_result(self):
+        """Check worker result from UI thread."""
+        try:
+            status, detail = self.result_queue.get_nowait()
+        except queue.Empty:
+            if self.processing:
+                self.root.after(150, self._check_worker_result)
+            return
+
+        self.progress.stop()
+        self.progress_label.config(text='')
+        self.processing = False
+        self.join_button.config(state='normal')
+        self.reset_button.config(state='normal')
+        # Removed: self.browser.configure(state='normal')  # ttk.Frame has no state option
+
+        if status == 'success':
+            self.summary.config(text=f'Joined! Output: {detail}')
+            messagebox.showinfo(
+                'Complete',
+                f'Videos joined successfully!\n\nOutput:\n{detail}',
+            )
+        else:
+            self.summary.config(text='Joining failed.')
+            messagebox.showerror('Error', detail)
+
+    def _reset(self):
+        if self.processing:
+            return
+        self.join_list.clear()
+        self.output_path.set('')
+        self._refresh_join_list()
+        self.progress.stop()
+        self.progress['value'] = 0
+        self.summary.config(text='')
+
+    def _on_close(self):
+        if self.processing:
+            if not messagebox.askyesno(
+                'Processing',
+                'Videos are still being joined. Close anyway?',
+            ):
+                return
+        self.root.destroy()
+
+
+def main():
+    root = tk.Tk()
+    VideoJoinerApp(root)
+    root.mainloop()
+
+
+if __name__ == '__main__':
+    main()

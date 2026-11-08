@@ -284,6 +284,83 @@
       </div>
     </div>
 
+    <div class="section" id="video-cutter">
+      <h2>🎬 video-cutter</h2>
+      <p>Cut out unwanted sections from video files using a graphical interface. Select a region on screen to define the section to remove, then the tool splits the video into segments and reassembles everything except the unwanted part. Quality settings let you control the balance between file size and quality.</p>
+      <ul class="features">
+        <li>Built-in file browser — navigate and select videos without leaving the app</li>
+        <li>Specify any start/end time in HH:MM:SS format</li>
+        <li>4 quality presets: Smallest ≈ 40% · Compact ≈ 90% · Balanced ≈ 110% · Good ≈ 125%</li>
+        <li>Real-time estimated output file size</li>
+        <li>Original file is never modified</li>
+      </ul>
+      <div class="callout">
+        <p><strong>Output:</strong> Saves as <code>filename_edited.mp4</code> in the same folder. Re-encodes using H.264.</p>
+      </div>
+      <div class="requirements">
+        <h3>Requirements</h3>
+        <p><code>ffmpeg</code>, <code>ffprobe</code>, Python 3 with <code>tkinter</code></p>
+      </div>
+    </div>
+
+    <div class="section" id="video-joiner">
+      <h2>🔗 video-joiner</h2>
+      <p>Join multiple video files into one seamless file. Add videos by double-clicking them in the built-in file browser, then reorder with Up/Down buttons before joining. Each file is re-encoded first to fix timestamps and keyframes for clean concatenation.</p>
+      <ul class="features">
+        <li>Double-click videos to add them to the join list</li>
+        <li>Reorder with Move Up / Move Down buttons</li>
+        <li>Remove individual files or clear all at once</li>
+        <li>Auto-generates output filename based on the first video</li>
+        <li>Original files are never modified</li>
+      </ul>
+      <div class="callout">
+        <p><strong>Output:</strong> Saves as <code>filename_joined.mp4</code>. Re-encodes all input files (H.264 + AAC) before concatenating.</p>
+      </div>
+      <div class="requirements">
+        <h3>Requirements</h3>
+        <p><code>ffmpeg</code>, <code>ffprobe</code>, Python 3 with <code>tkinter</code></p>
+      </div>
+    </div>
+
+    <div class="section" id="video-resizer">
+      <h2>📦 video-resizer</h2>
+      <p>Batch-reduce file sizes for all videos in a directory. Scan a folder, select which videos to process, and re-encode them with a quality preset of your choice. Supports recursive subdirectory scanning that mirrors the folder structure in the output.</p>
+      <ul class="features">
+        <li>Scan a directory to find all supported video files</li>
+        <li>Select individual videos to resize (Select All / per-checkbox)</li>
+        <li>Optional recursive subdirectory scanning</li>
+        <li>4 quality presets with real-time size estimates</li>
+        <li>Shows total MB saved on completion</li>
+        <li>Original files are never modified — resized copies saved alongside originals</li>
+      </ul>
+      <div class="callout">
+        <p><strong>Output:</strong> Saves as <code>filename_resized.mp4</code> in the same folder. Re-encodes using H.264.</p>
+      </div>
+      <div class="requirements">
+        <h3>Requirements</h3>
+        <p><code>ffmpeg</code>, <code>ffprobe</code>, Python 3 with <code>tkinter</code></p>
+      </div>
+    </div>
+
+    <div class="section" id="video-speeder">
+      <h2>⚡ video-speeder</h2>
+      <p>Change the playback speed of a video file. Choose from presets ranging from slow-motion (25%) to fast-forward (200%). The tool automatically adjusts both video timing and audio tempo so the result sounds natural — no robotic high-pitch or muffled slow audio.</p>
+      <ul class="features">
+        <li>Speed presets: 25%, 50%, 75%, 125%, 150%, 175%, 200%</li>
+        <li>Automatic audio tempo adjustment (atempo chain) — audio stays natural</li>
+        <li>Shows original vs. new duration preview</li>
+        <li>Built-in file browser for quick video selection</li>
+        <li>Original file is never modified</li>
+      </ul>
+      <div class="callout">
+        <p><strong>Output:</strong> Saves as <code>filename_speedXX.ext</code> beside the original (e.g., <code>video_speed150pct.mp4</code>).</p>
+      </div>
+      <div class="requirements">
+        <h3>Requirements</h3>
+        <p><code>ffmpeg</code>, <code>ffprobe</code>, Python 3 with <code>tkinter</code></p>
+      </div>
+    </div>
+
   </div>
 
 </body>

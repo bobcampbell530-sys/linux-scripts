@@ -1,0 +1,992 @@
+#!/usr/bin/env python3
+"""
+Batch Video Resizer - Process all videos in a directory to reduce file size.
+
+Output goes to RESIZED_VIDEOS subfolder.
+Cross-platform: works on Windows, macOS, and Linux.
+"""
+
+import os
+import queue
+import shutil
+import subprocess
+import threading
+import tkinter as tk
+from datetime import datetime
+from pathlib import Path
+from tkinter import messagebox, ttk
+
+
+VIDEO_EXTENSIONS = {
+    '.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm',
+    '.m4v', '.mpg', '.mpeg', '.3gp', '.ogv', '.ts'
+}
+
+
+def find_program(name):
+    """Return the executable path, or None if it is not on PATH."""
+    return shutil.which(name)
+
+
+def get_video_duration(filepath):
+    """Return video duration in seconds, or 0 if it cannot be read."""
+    cmd = [
+        find_program('ffprobe') or 'ffprobe',
+        '-v', 'error',
+        '-show_entries', 'format=duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1',
+        str(filepath),
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=True, timeout=30
+        )
+        return float(result.stdout.strip())
+    except (subprocess.SubprocessError, ValueError, OSError):
+        return 0.0
+
+
+def get_file_size(filepath):
+    """Get file size in MB."""
+    try:
+        return Path(filepath).stat().st_size / (1024 * 1024)
+    except OSError:
+        return 0
+
+
+def has_audio_stream(filepath):
+    """Return True if the input contains at least one audio stream."""
+    cmd = [
+        find_program('ffprobe') or 'ffprobe',
+        '-v', 'error',
+        '-select_streams', 'a',
+        '-show_entries', 'stream=codec_type',
+        '-of', 'csv=p=0',
+        str(filepath),
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=True, timeout=10
+        )
+        return bool(result.stdout.strip())
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+def get_video_bitrate(filepath):
+    """Get total video bitrate."""
+    try:
+        r = subprocess.run(
+            [
+                find_program('ffprobe') or 'ffprobe',
+                '-v', 'error',
+                '-show_entries', 'stream=bit_rate,codec_type',
+                '-of', 'csv=p=0',
+                str(filepath),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return sum(
+                int(line.split(',')[0])
+                for line in r.stdout.strip().split('\n')
+            )
+        return 5_000_000  # default 5 Mbps
+    except Exception:
+        return 5_000_000
+
+
+def estimate_output_size(filepath, quality):
+    """Estimate output file size based on quality setting."""
+    qmap = {
+        'Smallest': 0.42,
+        'Compact': 0.88,
+        'Balanced': 1.09,
+        'Good': 1.25,
+    }
+    multiplier = qmap.get(quality, 0.42)
+    bitrate = get_video_bitrate(filepath)
+    duration = get_video_duration(filepath)
+    est_bytes = bitrate * duration / 8 * multiplier
+    return est_bytes / (1024 * 1024)
+
+
+def compress_video(input_path, output_path, quality):
+    """Compress a single video to reduce file size."""
+    ffmpeg = find_program('ffmpeg')
+    if not ffmpeg:
+        raise RuntimeError(
+            'FFmpeg was not found.\n\n'
+            'Install FFmpeg and make sure it is available in PATH.'
+        )
+
+    input_path = str(input_path)
+    output_path = str(output_path)
+
+    has_audio = has_audio_stream(input_path)
+
+    qmap = {
+        'Smallest': {'preset': 'veryfast', 'crf': '30', 'ab': '64k'},
+        'Compact':  {'preset': 'fast',     'crf': '26', 'ab': '96k'},
+        'Balanced': {'preset': 'medium',   'crf': '24', 'ab': '128k'},
+        'Good':     {'preset': 'slower',   'crf': '22', 'ab': '128k'},
+    }
+
+    q = qmap[quality]
+
+    cmd = [
+        ffmpeg,
+        '-y',
+        '-i', input_path,
+        '-c:v', 'libx264',
+        '-preset', q['preset'],
+        '-crf', q['crf'],
+    ]
+
+    if has_audio:
+        cmd.extend(['-c:a', 'aac', '-b:a', q['ab']])
+    else:
+        cmd.append('-an')
+
+    cmd.extend(['-movflags', '+faststart', output_path])
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout or 'Unknown error').strip()
+        raise RuntimeError(f'FFmpeg could not process this video:\n\n{details[-3000:]}')
+
+    return True
+
+
+def get_desktop_directory():
+    """Return the usual Desktop directory, falling back to the home folder."""
+    home = Path.home()
+    desktop = home / 'Desktop'
+    return desktop if desktop.is_dir() else home
+
+
+class FileBrowserPanel(ttk.Frame):
+    """A simple cross-platform file browser."""
+
+    def __init__(self, parent, on_select=None):
+        super().__init__(parent, padding=5)
+        self.on_select = on_select
+        self.current_dir = Path.home()
+        self.last_browsed_dir = Path.home()
+        self.item_paths = {}
+        self._build_ui()
+        self._refresh()
+
+    def _build_ui(self):
+        nav = ttk.Frame(self)
+        nav.pack(fill='x')
+
+        ttk.Button(nav, text='↑ Up', command=self._go_up, width=6).pack(
+            side='left', padx=1
+        )
+        ttk.Button(nav, text='Home', command=self._go_home, width=6).pack(
+            side='left', padx=1
+        )
+        ttk.Button(
+            nav, text='Desktop',
+            command=lambda: self._navigate(get_desktop_directory()), width=8
+        ).pack(side='left', padx=1)
+
+        self.path_var = tk.StringVar(value=str(self.current_dir))
+        ttk.Entry(nav, textvariable=self.path_var).pack(
+            side='left', fill='x', expand=True, padx=3
+        )
+        ttk.Button(nav, text='Go', command=self._go_click, width=4).pack(
+            side='left'
+        )
+
+        ttk.Label(nav, text='Filter:').pack(side='right', padx=(5, 2))
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add('write', lambda *_: self._refresh())
+        ttk.Entry(nav, textvariable=self.filter_var, width=15).pack(side='right')
+
+        quick = ttk.Frame(self)
+        quick.pack(fill='x')
+        ttk.Label(quick, text='Quick:').pack(side='left')
+        for label, folder in (
+            ('Home', Path.home()),
+            ('Videos', Path.home() / 'Videos'),
+            ('Downloads', Path.home() / 'Downloads'),
+        ):
+            ttk.Button(
+                quick, text=label,
+                command=lambda p=folder: self._navigate(p), width=9
+            ).pack(side='left', padx=1)
+
+        tree_frame = ttk.Frame(self)
+        tree_frame.pack(fill='both', expand=True, pady=3)
+
+        vertical = ttk.Scrollbar(tree_frame)
+        vertical.pack(side='right', fill='y')
+        horizontal = ttk.Scrollbar(tree_frame, orient='horizontal')
+        horizontal.pack(side='bottom', fill='x')
+
+        # Include "name" as a real column.
+        self.tree = ttk.Treeview(
+            tree_frame,
+            columns=('name', 'size', 'modified'),
+            show='headings',
+            yscrollcommand=vertical.set,
+            xscrollcommand=horizontal.set,
+            height=14,
+        )
+        self.tree.pack(fill='both', expand=True)
+        vertical.config(command=self.tree.yview)
+        horizontal.config(command=self.tree.xview)
+
+        self.tree.heading('name', text='Name', anchor='w')
+        self.tree.heading('size', text='Size', anchor='e')
+        self.tree.heading('modified', text='Modified', anchor='w')
+        self.tree.column('name', width=440, minwidth=180, anchor='w')
+        self.tree.column('size', width=100, anchor='e')
+        self.tree.column('modified', width=160, anchor='w')
+
+        self.tree.bind('<Double-1>', self._on_double)
+        self.tree.bind('<Return>', self._on_double)
+
+        self.status = ttk.Label(self, text='Ready')
+        self.status.pack(fill='x', pady=(2, 0))
+
+    def _refresh(self):
+        self.tree.delete(*self.tree.get_children())
+        self.item_paths.clear()
+
+        if not self.current_dir.is_dir():
+            self.current_dir = Path.home()
+
+        self.path_var.set(str(self.current_dir))
+        filter_text = self.filter_var.get().strip().casefold()
+
+        try:
+            directories = []
+            files = []
+
+            with os.scandir(self.current_dir) as entries:
+                for entry in entries:
+                    if entry.name.startswith('.'):
+                        continue
+                    if filter_text and filter_text not in entry.name.casefold():
+                        continue
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            directories.append(entry)
+                        else:
+                            files.append(entry)
+                    except OSError:
+                        continue
+
+            directories.sort(key=lambda item: item.name.casefold())
+            files.sort(key=lambda item: item.name.casefold())
+
+            for entry in directories + files:
+                path = Path(entry.path)
+                is_dir = entry.is_dir(follow_symlinks=False)
+
+                if is_dir:
+                    display_name = f'[Folder] {entry.name}'
+                    size_text = '—'
+                    modified_text = '—'
+                else:
+                    extension = path.suffix.lower()
+                    prefix = '[Video] ' if extension in VIDEO_EXTENSIONS else ''
+                    display_name = prefix + entry.name
+                    try:
+                        stat = entry.stat()
+                        size_text = f'{stat.st_size / (1024 * 1024):.1f} MB'
+                        modified_text = datetime.fromtimestamp(
+                            stat.st_mtime
+                        ).strftime('%Y-%m-%d %H:%M')
+                    except OSError:
+                        size_text = '?'
+                        modified_text = '?'
+
+                item_id = self.tree.insert(
+                    '', 'end',
+                    values=(display_name, size_text, modified_text)
+                )
+                self.item_paths[item_id] = path
+
+            total = len(directories) + len(files)
+            self.status.config(text=f'{total} items  |  {self.current_dir}')
+
+        except (PermissionError, OSError) as error:
+            self.status.config(text=f'Cannot read folder: {error}')
+
+    def _on_double(self, _event=None):
+        selection = self.tree.selection()
+        if not selection:
+            return
+
+        path = self.item_paths.get(selection[0])
+        if not path:
+            return
+
+        if path.is_dir():
+            self._navigate(path)
+        elif path.suffix.lower() in VIDEO_EXTENSIONS:
+            if self.on_select:
+                self.on_select(path)
+
+    def _navigate(self, path):
+        # expanduser handles typed paths such as ~/Videos on Unix-like systems.
+        candidate = Path(os.path.expandvars(os.path.expanduser(str(path))))
+        if candidate.is_dir():
+            self.current_dir = candidate.resolve()
+            self._refresh()
+        else:
+            messagebox.showwarning(
+                'Folder not found', f'This folder does not exist:\n{candidate}'
+            )
+
+    def _go_up(self):
+        parent = self.current_dir.parent
+        if parent != self.current_dir:
+            self._navigate(parent)
+
+    def _go_home(self):
+        self._navigate(Path.home())
+
+    def _go_click(self):
+        value = self.path_var.get().strip()
+        if value:
+            self._navigate(value)
+
+
+class DirectoryChooser(tk.Toplevel):
+    """Single-column folder picker. Shows folders only, hides dot-folders."""
+
+    def __init__(self, parent, start_dir=None, title='Select Source Directory'):
+        super().__init__(parent)
+        self.title(title)
+        self.geometry('560x520')
+        self.transient(parent)
+        self.result = None
+
+        if start_dir and Path(start_dir).is_dir():
+            self.current_dir = Path(start_dir).resolve()
+        else:
+            self.current_dir = Path.home()
+
+        self._build_ui()
+        self._refresh()
+        self.grab_set()
+        self.focus_set()
+
+    def _build_ui(self):
+        frame = ttk.Frame(self, padding=8)
+        frame.pack(fill='both', expand=True)
+
+        # Navigation row
+        nav = ttk.Frame(frame)
+        nav.pack(fill='x')
+        ttk.Button(nav, text='↑ Up', width=6, command=self._go_up).pack(
+            side='left', padx=1
+        )
+        ttk.Button(nav, text='Home', width=6, command=lambda: self._navigate(
+            Path.home()
+        )).pack(side='left', padx=1)
+        self.path_var = tk.StringVar()
+        entry = ttk.Entry(nav, textvariable=self.path_var)
+        entry.pack(side='left', fill='x', expand=True, padx=3)
+        entry.bind('<Return>', lambda e: self._navigate(
+            self.path_var.get()
+        ))
+        ttk.Button(nav, text='Go', width=4, command=lambda: self._navigate(
+            self.path_var.get()
+        )).pack(side='left')
+
+        # Quick-access row
+        qa = ttk.Frame(frame)
+        qa.pack(fill='x', pady=(3, 0))
+        ttk.Label(qa, text='Quick:').pack(side='left')
+        for label, path in [
+            ('Home', Path.home()),
+            ('Videos', Path.home() / 'Videos'),
+            ('Downloads', Path.home() / 'Downloads'),
+        ]:
+            ttk.Button(
+                qa, text=label, width=9,
+                command=lambda p=path: self._navigate(p)
+            ).pack(side='left', padx=1)
+
+        # Single-column folder list
+        tree_frame = ttk.Frame(frame)
+        tree_frame.pack(fill='both', expand=True, pady=6)
+        vs = ttk.Scrollbar(tree_frame)
+        vs.pack(side='right', fill='y')
+        self.tree = ttk.Treeview(
+            tree_frame, show='tree', selectmode='browse',
+            yscrollcommand=vs.set
+        )
+        self.tree.pack(side='left', fill='both', expand=True)
+        vs.config(command=self.tree.yview)
+        self.tree.bind('<Double-1>', self._on_double)
+        self.tree.bind('<Return>', self._on_double)
+
+        self.status = ttk.Label(frame, text='')
+        self.status.pack(fill='x')
+
+        # Buttons
+        btns = ttk.Frame(frame)
+        btns.pack(fill='x', pady=(6, 0))
+        ttk.Button(btns, text='Cancel', command=self.destroy).pack(
+            side='right', padx=3
+        )
+        ttk.Button(btns, text='Select This Folder', command=self._select).pack(
+            side='right', padx=3
+        )
+
+    def _refresh(self):
+        self.tree.delete(*self.tree.get_children())
+        self.path_var.set(str(self.current_dir))
+
+        try:
+            folders = []
+            for entry in os.scandir(self.current_dir):
+                if entry.name.startswith('.'):
+                    continue  # hide hidden folders
+                try:
+                    if entry.is_dir():  # follows symlinks (handy for mounts)
+                        folders.append(entry)
+                except OSError:
+                    continue
+            folders.sort(key=lambda e: e.name.casefold())
+
+            for e in folders:
+                self.tree.insert('', 'end', iid=e.path, text=f'📁 {e.name}')
+            self.status.config(text=f'{len(folders)} folder(s)')
+        except PermissionError:
+            self.status.config(text='Permission denied')
+        except OSError as ex:
+            self.status.config(text=f'Error: {ex}')
+
+    def _navigate(self, path):
+        candidate = Path(os.path.expandvars(os.path.expanduser(str(path))))
+        if candidate.is_dir():
+            self.current_dir = candidate.resolve()
+            self._refresh()
+        else:
+            messagebox.showwarning(
+                'Folder not found', f'This folder does not exist:\n{candidate}'
+            )
+
+    def _go_up(self):
+        parent = self.current_dir.parent
+        if parent != self.current_dir:
+            self._navigate(parent)
+
+    def _on_double(self, event=None):
+        sel = self.tree.selection()
+        if sel:
+            self._navigate(sel[0])
+
+    def _select(self):
+        self.result = self.current_dir
+        self.destroy()
+
+
+class VideoResizerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title('Batch Video Resizer')
+        self.root.geometry('850x680')
+        self.root.minsize(700, 600)
+        self.root.resizable(True, True)
+
+        self.source_dir = tk.StringVar()
+        self.output_dir = tk.StringVar()
+        self.quality_var = tk.StringVar(value='Smallest')
+        self.include_subdirs = tk.BooleanVar(value=False)
+        self.select_all_var = tk.BooleanVar(value=True)
+        self.video_list = []
+        self.video_selectors = {}  # tree item ID -> BooleanVar
+        self.processing = False
+        self.result_queue = queue.Queue()
+
+        self._build_ui()
+        self._check_dependencies()
+        self.root.protocol('WM_DELETE_WINDOW', self._on_close)
+
+    def _check_dependencies(self):
+        missing = [
+            name for name in ('ffmpeg', 'ffprobe') if not find_program(name)
+        ]
+        if missing:
+            messagebox.showwarning(
+                'FFmpeg required',
+                'The following required programs were not found:\n\n'
+                + '\n'.join(missing)
+                + '\n\nInstall FFmpeg and make sure it is available in PATH.'
+            )
+
+    def _build_ui(self):
+        main = ttk.Frame(self.root, padding=12)
+        main.pack(fill='both', expand=True)
+
+        ttk.Label(
+            main, text='Batch Video Resizer', font=('TkDefaultFont', 18, 'bold')
+        ).pack(pady=(0, 10))
+
+        # === SOURCE DIRECTORY ===
+        src_frame = ttk.LabelFrame(main, text='Source Directory', padding=8)
+        src_frame.pack(fill='x', pady=(0, 8))
+
+        src_row = ttk.Frame(src_frame)
+        src_row.pack(fill='x')
+        ttk.Label(src_row, text='Directory:').pack(side='left')
+        ttk.Entry(
+            src_row, textvariable=self.source_dir, width=50
+        ).pack(side='left', padx=5, fill='x', expand=True)
+        ttk.Button(
+            src_row, text='Browse...', command=self.browse_source
+        ).pack(side='left')
+
+        # === QUALITY ===
+        q_frame = ttk.LabelFrame(main, text='Quality Setting', padding=8)
+        q_frame.pack(fill='x', pady=(0, 8))
+
+        q_row = ttk.Frame(q_frame)
+        q_row.pack(fill='x')
+        ttk.Label(q_row, text='Quality → file size:').pack(side='left')
+        ttk.OptionMenu(
+            q_row, self.quality_var, 'Smallest',
+            'Smallest', 'Compact', 'Balanced', 'Good'
+        ).pack(side='left', padx=5)
+        quality_desc = (
+            'Smallest ≈ 40% · Compact ≈ 90% · Balanced ≈ 110% · Good ≈ 125%'
+        )
+        ttk.Label(q_row, text=quality_desc, foreground='#339933').pack(
+            side='left', padx=5
+        )
+
+        # === SUBDIRECTORIES ===
+        sub_frame = ttk.Frame(q_frame)
+        sub_frame.pack(fill='x', pady=(6, 0))
+        ttk.Checkbutton(
+            sub_frame, text='📂 Include subdirectories',
+            variable=self.include_subdirs
+        ).pack(side='left')
+        ttk.Label(
+            sub_frame, text='Scan folders recursively (mirrors structure in output)'
+        ).pack(side='left', padx=5)
+
+        # === OUTPUT ===
+        out_frame = ttk.LabelFrame(main, text='Output Directory', padding=8)
+        out_frame.pack(fill='x', pady=(0, 8))
+        ttk.Label(out_frame, text='Videos will be saved to:').pack(side='left')
+        ttk.Entry(
+            out_frame, textvariable=self.output_dir, state='readonly', width=55
+        ).pack(side='left', padx=5, fill='x', expand=True)
+
+        # === VIDEO LIST ===
+        list_frame = ttk.LabelFrame(main, text='Videos Found', padding=5)
+        list_frame.pack(fill='both', expand=True, pady=(0, 8))
+
+        # Select all checkbox row
+        select_row = ttk.Frame(list_frame)
+        select_row.pack(fill='x', padx=5, pady=(2, 0))
+        ttk.Checkbutton(
+            select_row, text='Select All',
+            variable=self.select_all_var, command=self._toggle_all
+        ).pack(side='left')
+        self.selected_count = ttk.Label(select_row, text='')
+        self.selected_count.pack(side='right')
+
+        list_scroll = ttk.Scrollbar(list_frame)
+        list_scroll.pack(side='right', fill='y')
+
+        self.list_tree = ttk.Treeview(
+            list_frame,
+            columns=('select', 'orig', 'est', 'status'),
+            show='headings',
+            yscrollcommand=list_scroll.set,
+            height=10,
+        )
+        self.list_tree.pack(fill='both', expand=True)
+        list_scroll.config(command=self.list_tree.yview)
+
+        self.list_tree.heading('select', text='✓', anchor='c')
+        self.list_tree.heading('#0', text='File', anchor='w')
+        self.list_tree.heading('orig', text='Original', anchor='e')
+        self.list_tree.heading('est', text='Est. Output', anchor='e')
+        self.list_tree.heading('status', text='Status', anchor='w')
+
+        self.list_tree.column('select', width=30, minwidth=30)
+        self.list_tree.column('#0', width=400, minwidth=200)
+        self.list_tree.column('orig', width=80)
+        self.list_tree.column('est', width=80)
+        self.list_tree.column('status', width=100)
+
+        # Click handler for checkboxes and column headings
+        self.list_tree.bind('<ButtonRelease-1>', self._on_tree_click)
+        self.list_tree.heading(
+            'select', command=lambda: self._toggle_all()
+        )
+        # Column heading click
+        self.list_tree.tag_configure('selected', background='#e6f3ff')
+
+        # === BUTTONS ===
+        btn_frame = ttk.Frame(main)
+        btn_frame.pack(fill='x')
+        self.scan_button = ttk.Button(
+            btn_frame, text='🔍 Scan Directory',
+            command=self.scan_directory
+        )
+        self.scan_button.pack(side='left', expand=True, padx=3)
+        self.resize_button = ttk.Button(
+            btn_frame, text='▶️ Resize Selected',
+            command=self.resize_selected
+        )
+        self.resize_button.pack(side='left', expand=True, padx=3)
+        self.reset_button = ttk.Button(
+            btn_frame, text='Reset', command=self.reset
+        )
+        self.reset_button.pack(side='left', expand=True, padx=3)
+
+        # === PROGRESS ===
+        progress_frame = ttk.Frame(main)
+        progress_frame.pack(fill='x', pady=(5, 0))
+        self.progress_label = ttk.Label(progress_frame, text='')
+        self.progress_label.pack(fill='x')
+        self.progress = ttk.Progressbar(progress_frame, mode='indeterminate')
+        self.progress.pack(fill='x')
+
+        self.summary = ttk.Label(main, text='', wraplength=800, foreground='#336633')
+        self.summary.pack(pady=(5, 0))
+
+    def browse_source(self):
+        """Browse for source directory."""
+        start = self.source_dir.get().strip()
+        if not start:
+            start = str(Path.home() / 'Videos')
+        dlg = DirectoryChooser(self.root, start_dir=start)
+        self.root.wait_window(dlg)
+        path = dlg.result
+        if path:
+            self.source_dir.set(str(path))
+            self.output_dir.set(str(path))
+            self.scan_directory()
+
+    def scan_directory(self):
+        """Scan the source directory for video files."""
+        source = Path(self.source_dir.get().strip())
+        if not source or not source.is_dir():
+            messagebox.showerror('Error', 'Please select a valid directory.')
+            return
+
+        # Update output path
+        self.output_dir.set(str(source))
+
+        # Clear and populate
+        for item in self.list_tree.get_children():
+            self.list_tree.delete(item)
+
+        self.video_list = []
+        quality = self.quality_var.get()
+        recursive = self.include_subdirs.get()
+
+        videos = []
+        if recursive:
+            # Walk subdirectories recursively
+            for dirpath, dirnames, filenames in os.walk(source):
+                # Skip hidden directories
+                dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+                dirnames.sort(key=str.casefold)
+                for f in filenames:
+                    if f.startswith('.'):
+                        continue
+                    ext = Path(f).suffix.lower()
+                    if ext in VIDEO_EXTENSIONS:
+                        full = Path(dirpath) / f
+                        if full.is_file():
+                            rel = full.relative_to(source)
+                            display = str(rel)
+                            size = get_file_size(full)
+                            est = estimate_output_size(full, quality)
+                            videos.append((display, full, size, est, 'Pending'))
+        else:
+            for f in source.iterdir():
+                if f.name.startswith('.'):
+                    continue
+                ext = f.suffix.lower()
+                if ext in VIDEO_EXTENSIONS and f.is_file():
+                    size = get_file_size(f)
+                    est = estimate_output_size(f, quality)
+                    videos.append((f.name, f, size, est, 'Pending'))
+
+        # Sort by display name
+        videos.sort(key=lambda x: x[0].casefold())
+
+        self.video_selectors = {}
+        selected_count = len(videos) if self.select_all_var.get() else 0
+
+        for display, full, orig, est, status in videos:
+            self.video_list.append(full)
+            var = tk.BooleanVar(value=self.select_all_var.get())
+            item_id = self.list_tree.insert('', 'end', values=(
+                '✓', display, f'{orig:.0f} MB', f'{est:.0f} MB', status
+            ), text=display)
+            self.video_selectors[item_id] = var
+
+        self._update_selected_count(len(videos), selected_count)
+        sub_note = ' (recursive)' if recursive else ''
+        self.summary.config(text=f'Found {len(videos)} video(s){sub_note}')
+
+    def _toggle_all(self):
+        """Toggle all checkboxes."""
+        state = self.select_all_var.get()
+        for var in self.video_selectors.values():
+            var.set(state)
+        selected = sum(1 for v in self.video_selectors.values() if v.get())
+        self._update_selected_count(len(self.video_selectors), selected)
+        for item_id, var in self.video_selectors.items():
+            status = '✓' if var.get() else ' '
+            self.list_tree.set(item_id, 'select', status)
+
+    def _on_tree_click(self, event):
+        """Toggle checkbox when clicking a row."""
+        region = self.list_tree.identify_region(event.x, event.y)
+        if region == 'heading':
+            return  # handled by heading command
+        if region not in ('cell', ''):
+            return
+
+        item_id = self.list_tree.identify_row(event.y)
+        if not item_id or item_id not in self.video_selectors:
+            return
+
+        var = self.video_selectors[item_id]
+        var.set(not var.get())
+        status = '✓' if var.get() else ' '
+        self.list_tree.set(item_id, 'select', status)
+
+        # Update background color
+        if var.get():
+            self.list_tree.item(item_id, tags=('selected',))
+        else:
+            self.list_tree.item(item_id, tags=())
+
+        selected = sum(1 for v in self.video_selectors.values() if v.get())
+        self._update_selected_count(len(self.video_selectors), selected)
+
+    def _update_selected_count(self, total, selected):
+        """Update the selected count label."""
+        if total == 0:
+            self.selected_count.config(text='')
+        else:
+            self.selected_count.config(text=f'{selected}/{total} selected')
+
+    def resize_selected(self):
+        """Start batch resize of selected videos only."""
+        # Build list of selected paths
+        selected = []
+        for item_id, var in self.video_selectors.items():
+            if var.get():
+                idx = list(self.video_selectors.keys()).index(item_id)
+                selected.append(self.video_list[idx])
+
+        if not selected:
+            messagebox.showerror(
+                'Error',
+                'No videos selected. Check the boxes to select videos to resize.'
+            )
+            return
+
+        if self.processing:
+            messagebox.showinfo(
+                'Info', 'Already processing. Wait for it to finish.'
+            )
+            return
+
+        reply = messagebox.askyesno(
+            'Confirm',
+            f'Resize {len(selected)} video(s)?\n\n'
+            f'Source: {self.source_dir.get()}\n'
+            f'Output: {self.output_dir.get()}\n'
+            f'Quality: {self.quality_var.get()}\n'
+            f"{'(recursive)' if self.include_subdirs.get() else ''}\n\n"
+            f'This will take several minutes. Original files are NOT modified.'
+        )
+        if not reply:
+            return
+
+        self.processing = True
+        self.scan_button.config(state='disabled')
+        self.resize_button.config(state='disabled')
+        self.reset_button.config(state='disabled')
+        self.progress.start(12)
+        self.progress_label.config(text='Processing videos…')
+        self.summary.config(text='')
+
+        worker = threading.Thread(
+            target=self._resize_worker,
+            args=(selected,),
+            daemon=True,
+        )
+        worker.start()
+        self.root.after(100, self._check_resize_result)
+
+    def _resize_worker(self, selected):
+        """Worker thread for batch resize."""
+        try:
+            # Resized files go in the same folder as the original
+
+            quality = self.quality_var.get()
+            total = len(selected)
+            success = 0
+            failed = 0
+            saved_bytes = 0
+
+            for i, video_path in enumerate(selected):
+                filename = video_path.name
+                name_no_ext = video_path.stem
+                ext = video_path.suffix
+
+                # Place resized file in same folder as original
+                out_path = video_path.with_name(f'{name_no_ext}_resized{ext}')
+
+                self.root.after(
+                    0,
+                    self._update_progress,
+                    i + 1,
+                    total,
+                    filename,
+                    'Processing...',
+                )
+
+                try:
+                    orig_size = get_file_size(video_path)
+                    compress_video(video_path, out_path, quality)
+                    new_size = get_file_size(out_path)
+                    saved = orig_size - new_size
+                    saved_bytes += saved
+
+                    self.root.after(
+                        0,
+                        self._update_progress,
+                        i + 1,
+                        total,
+                        filename,
+                        f'✓ {saved:.0f} MB saved',
+                        f'{new_size:.0f} MB',
+                    )
+                    success += 1
+
+                except Exception as e:
+                    self.root.after(
+                        0,
+                        self._update_progress,
+                        i + 1,
+                        total,
+                        filename,
+                        f'✗ Error',
+                    )
+                    failed += 1
+
+            self.result_queue.put(
+                ('success', success, failed, saved_bytes, self.source_dir.get())
+            )
+        except Exception as e:
+            self.result_queue.put(('error', 0, 0, 0, str(e)))
+
+    def _update_progress(self, index, total, filename, status, est=''):
+        """Update progress and tree from worker thread."""
+        self.progress_label.config(text=f'Processing {index}/{total}: {filename}')
+        self.progress['value'] = (index / total) * 100
+
+        # Update tree status
+        idx = self._find_item_by_path(filename)
+        if idx:
+            self.list_tree.set(idx, 'status', status)
+            if est:
+                self.list_tree.set(idx, 'est', est)
+            self.list_tree.see(idx)
+
+    def _check_resize_result(self):
+        """Check worker result from UI thread."""
+        try:
+            status, success, failed, saved_bytes, detail = (
+                self.result_queue.get_nowait()
+            )
+        except queue.Empty:
+            if self.processing:
+                self.root.after(150, self._check_resize_result)
+            return
+
+        self.progress.stop()
+        self.progress_label.config(text='')
+        self.processing = False
+        self.scan_button.config(state='normal')
+        self.resize_button.config(state='normal')
+        self.reset_button.config(state='normal')
+
+        if status == 'success':
+            # Update checkbox status for completed items
+            for item_id, var in self.video_selectors.items():
+                if var.get():
+                    self.video_selectors[item_id].set(False)
+                    self.list_tree.set(item_id, 'select', ' ')
+
+            saved_mb = saved_bytes / (1024 * 1024)
+            self.summary.config(
+                text=f'Done! {success} succeeded, {failed} failed. '
+                f'Saved {saved_mb:.1f} MB total.\nOutput: {detail}'
+            )
+            messagebox.showinfo(
+                'Complete',
+                f'Resized {success} video(s), {failed} failed.\n\n'
+                f'Saved {saved_mb:.1f} MB total.\n'
+                f'Output: {detail}'
+            )
+        else:
+            self.summary.config(text='Processing failed.')
+            messagebox.showerror('Error', f'Batch resize failed:\n{detail}')
+
+    def _find_item_by_path(self, path):
+        """Find tree item by video file path."""
+        target_name = Path(path).name
+        for item in self.list_tree.get_children():
+            if self.list_tree.item(item)['text'] == target_name:
+                return item
+        return None
+
+    def reset(self):
+        """Reset everything."""
+        self.source_dir.set('')
+        self.output_dir.set('')
+        self.video_list = []
+        self.video_selectors = {}
+        self.select_all_var.set(True)
+        for item in self.list_tree.get_children():
+            self.list_tree.delete(item)
+        self.progress_label.config(text='')
+        self.progress.stop()
+        self.progress['value'] = 0
+        self.summary.config(text='')
+        self.selected_count.config(text='')
+
+    def _on_close(self):
+        if self.processing:
+            if not messagebox.askyesno(
+                'Processing',
+                'A video is still being processed. Close the application anyway?'
+            ):
+                return
+        self.root.destroy()
+
+
+def main():
+    root = tk.Tk()
+    VideoResizerApp(root)
+    root.mainloop()
+
+
+if __name__ == '__main__':
+    main()
