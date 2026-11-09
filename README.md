@@ -28,6 +28,7 @@ Run `video-tools` to launch a menu-based interface for all 4 video editing tools
 | [video-joiner](video-joiner) | Join multiple videos into one |
 | [video-resizer](video-resizer) | Batch reduce file sizes for all videos in a directory |
 | [video-speeder](video-speeder) | Change playback speed (25%–200%) with natural audio |
+| [video-meta](video-meta) | Batch edit Artist/Album metadata tags (20+ formats incl. MKV) |
 
 Run `video-tools` for a unified menu launcher.
 

@@ -1,0 +1,816 @@
+#!/usr/bin/env python3
+"""Batch edit the Artist and Album metadata tags across an entire folder tree.
+
+Supports: MP3, FLAC, OGG, OGA, M4A, MP4, WAV, WMA, AAC, OPUS, MKV, APE, WV, TAK, MPC, AIFF, DSF, MPP, SPX, TTA.
+"""
+
+import os
+import re
+import shutil
+import subprocess
+import json
+import tkinter as tk
+from datetime import datetime
+from pathlib import Path
+from tkinter import messagebox, ttk
+
+from mutagen import File as mutagen_file
+from mutagen.mp3 import MP3
+from mutagen.id3 import TPE1, TIT2
+from mutagen.flac import FLAC
+from mutagen.oggvorbis import OggVorbis
+from mutagen.mp4 import MP4
+from mutagen.wave import WAVE
+from mutagen.asf import ASF
+
+AUDIO_EXTENSIONS = {
+    '.mp3', '.flac', '.ogg', '.oga', '.m4a', '.mp4', '.wav', '.wma',
+    '.aac', '.opus', '.mkv', '.ape', '.wv', '.tak', '.mpc', '.aiff', '.dsf',
+    '.mpp', '.spx', '.tta',
+}
+
+
+def _read_mkv_tags(filepath: str) -> dict:
+    """Read artist/album tags from MKV via ffprobe (JSON output)."""
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-print_format', 'json',
+             '-show_format', str(filepath)],
+            capture_output=True, text=True, timeout=10,
+        )
+        data = json.loads(result.stdout)
+        tags = data.get("format", {}).get("tags", {})
+        return {"artist": tags.get("ARTIST", ""), "album": tags.get("ALBUM", "")}
+    except Exception:
+        return {"artist": "", "album": ""}
+
+
+def _write_mkv_tags(filepath: str, artist: str, album: str) -> str:
+    """Write artist/album tags to MKV via ffmpeg. Returns status string."""
+    try:
+        cmd = ['ffmpeg', '-y', '-i', str(filepath)]
+        if artist:
+            cmd += ['-metadata', f'artist={artist}']
+        if album:
+            cmd += ['-metadata', f'album={album}']
+        tmp = f'{filepath}.tmp.mkv'
+        cmd += ['-c', 'copy', tmp]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0:
+            os.replace(tmp, filepath)
+            return "OK"
+        # Extract the actual error line from ffmpeg stderr
+        stderr_lines = [l for l in result.stderr.splitlines() if 'Error' in l]
+        err_msg = stderr_lines[-1] if stderr_lines else "FFmpeg failed"
+        return err_msg
+    except Exception as e:
+        # Clean up temp file if it exists
+        tmp = f"{filepath}.tmp.mkv"
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+        return f"Error: {e}"
+
+
+def find_program(name):
+    """Return the executable path, or None if not on PATH."""
+    return shutil.which(name)
+
+
+def get_desktop_directory():
+    """Return Desktop directory, or home if it doesn't exist."""
+    home = Path.home()
+    desktop = home / 'Desktop'
+    return desktop if desktop.is_dir() else home
+
+
+def guess_artist(folder_name: str) -> str:
+    """Turn a folder name into a plausible artist name."""
+    name = folder_name.strip()
+
+    parts = re.split(r'\s*[-–—]\s*', name, maxsplit=1)
+    if len(parts) == 2:
+        a, b = parts
+        a_words = a.split()
+        b_words = b.split()
+        if len(b_words) > len(a_words) and any(c.isupper() for c in b):
+            return b.strip()
+        elif len(a_words) > len(b_words) and any(c.isupper() for c in a):
+            return a.strip()
+        if any(c.isupper() for c in a) and not any(c.isupper() for c in b):
+            return a.strip()
+        if any(c.isupper() for c in b) and not any(c.isupper() for c in a):
+            return b.strip()
+        return b.strip()
+
+    roman = {'I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X',
+             'XI', 'XII', 'XIII', 'XIV', 'XV',
+             'CD', 'LP', 'EP', 'DVD', 'REMIX', 'VOL', 'VOL.'}
+    words = name.split()
+    result = []
+    for w in words:
+        if w.upper() in roman:
+            result.append(w.upper())
+        else:
+            result.append(w.capitalize())
+    return ' '.join(result)
+
+
+def guess_album(folder_name: str) -> str:
+    """Turn a folder name into a plausible album name."""
+    parts = re.split(r'\s*[-–—]\s*', folder_name.strip(), maxsplit=1)
+    if len(parts) == 2:
+        a, b = parts
+        a_words = a.split()
+        b_words = b.split()
+        if len(a_words) > len(b_words) and any(c.isupper() for c in a):
+            return b.strip().title()
+        return b.strip()
+
+    roman = {'I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X',
+             'XI', 'XII', 'XIII', 'XIV', 'XV',
+             'CD', 'LP', 'EP', 'DVD', 'REMIX', 'VOL', 'VOL.'}
+    words = folder_name.strip().split()
+    result = []
+    for w in words:
+        if w.upper() in roman:
+            result.append(w.upper())
+        else:
+            result.append(w.capitalize())
+    return ' '.join(result)
+
+
+class FileBrowserPanel(ttk.Frame):
+    """Built-in file browser — shows all folders for navigation, but only
+    supported files (not .zip, .txt, .html, etc.)."""
+
+    def __init__(self, parent, on_select=None):
+        super().__init__(parent, padding=5)
+        self.on_select = on_select
+        self.current_dir = Path.home()
+        self.item_paths = {}
+        self._build_ui()
+        self._refresh()
+
+    def _build_ui(self):
+        # ── Navigation bar ──
+        nav = ttk.Frame(self)
+        nav.pack(fill='x')
+
+        ttk.Button(nav, text='↑ Up', command=self._go_up, width=6).pack(
+            side='left', padx=1
+        )
+        ttk.Button(nav, text='Home', command=self._go_home, width=6).pack(
+            side='left', padx=1
+        )
+        ttk.Button(
+            nav, text='Desktop',
+            command=lambda: self._navigate(get_desktop_directory()), width=8
+        ).pack(side='left', padx=1)
+
+        self.path_var = tk.StringVar(value=str(self.current_dir))
+        ttk.Entry(nav, textvariable=self.path_var).pack(
+            side='left', fill='x', expand=True, padx=3
+        )
+        ttk.Button(nav, text='Go', command=self._go_click, width=4).pack(
+            side='left'
+        )
+
+        ttk.Label(nav, text='Filter:').pack(side='right', padx=(5, 2))
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add('write', lambda *_: self._refresh())
+        ttk.Entry(nav, textvariable=self.filter_var, width=15).pack(side='right')
+
+        # ── Quick-access bar ──
+        qa = ttk.Frame(self)
+        qa.pack(fill='x')
+        ttk.Label(qa, text='Quick:').pack(side='left')
+        for label, folder in (
+            ('Home', Path.home()),
+            ('Videos', Path.home() / 'Videos'),
+            ('Downloads', Path.home() / 'Downloads'),
+        ):
+            ttk.Button(
+                qa, text=label,
+                command=lambda p=folder: self._navigate(p), width=9
+            ).pack(side='left', padx=1)
+
+        # ── Tree ──
+        tree_frame = ttk.Frame(self)
+        tree_frame.pack(fill='both', expand=True, pady=3)
+
+        vertical = ttk.Scrollbar(tree_frame)
+        vertical.pack(side='right', fill='y')
+        horizontal = ttk.Scrollbar(tree_frame, orient='horizontal')
+        horizontal.pack(side='bottom', fill='x')
+
+        self.tree = ttk.Treeview(
+            tree_frame,
+            columns=('size', 'modified'),
+            show='headings',
+            yscrollcommand=vertical.set,
+            xscrollcommand=horizontal.set,
+            height=14,
+        )
+        self.tree.pack(fill='both', expand=True)
+        vertical.config(command=self.tree.yview)
+        horizontal.config(command=self.tree.xview)
+
+        self.tree.heading('#0', text='Name')
+        self.tree.heading('size', text='Size')
+        self.tree.heading('modified', text='Modified')
+        self.tree.column('#0', width=440, minwidth=180)
+        self.tree.column('size', width=100)
+        self.tree.column('modified', width=160)
+
+        self.tree.bind('<Double-1>', self._on_double)
+        self.tree.bind('<Return>', self._on_double)
+
+        self.status = ttk.Label(self, text='Ready')
+        self.status.pack(fill='x', pady=(2, 0))
+
+    def _refresh(self):
+        self.tree.delete(*self.tree.get_children())
+        self.item_paths.clear()
+
+        if not self.current_dir.is_dir():
+            self.current_dir = Path.home()
+
+        self.path_var.set(str(self.current_dir))
+        filter_text = self.filter_var.get().strip().casefold()
+
+        try:
+            directories = []
+            audio_files = []
+
+            with os.scandir(self.current_dir) as entries:
+                for entry in entries:
+                    if entry.name.startswith('.'):
+                        continue
+                    if filter_text and filter_text not in entry.name.casefold():
+                        continue
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            directories.append(entry)
+                        else:
+                            ext = os.path.splitext(entry.name)[1].lower()
+                            if ext in AUDIO_EXTENSIONS:
+                                audio_files.append(entry)
+                    except OSError:
+                        continue
+
+            directories.sort(key=lambda item: item.name.casefold())
+            audio_files.sort(key=lambda item: item.name.casefold())
+
+            for entry in directories:
+                path = Path(entry.path)
+                display_name = f'[Folder] {entry.name}'
+                size_text = '—'
+                modified_text = '—'
+                item_id = self.tree.insert(
+                    '', 'end',
+                    values=(display_name, size_text, modified_text)
+                )
+                self.item_paths[item_id] = path
+
+            for entry in audio_files:
+                path = Path(entry.path)
+                display_name = f'[Audio] {entry.name}'
+                try:
+                    stat = entry.stat()
+                    size_text = f'{stat.st_size / (1024 * 1024):.1f} MB'
+                    modified_text = datetime.fromtimestamp(
+                        stat.st_mtime
+                    ).strftime('%Y-%m-%d %H:%M')
+                except OSError:
+                    size_text = '?'
+                    modified_text = '?'
+                item_id = self.tree.insert(
+                    '', 'end',
+                    values=(display_name, size_text, modified_text)
+                )
+                self.item_paths[item_id] = path
+
+            total = len(directories) + len(audio_files)
+            self.status.config(text=f'{total} items  |  {self.current_dir}')
+
+        except (PermissionError, OSError) as error:
+            self.status.config(text=f'Cannot read folder: {error}')
+
+    def _on_double(self, _event=None):
+        selection = self.tree.selection()
+        if not selection:
+            return
+
+        path = self.item_paths.get(selection[0])
+        if not path:
+            return
+
+        if path.is_dir():
+            self._navigate(path)
+        elif path.suffix.lower() in AUDIO_EXTENSIONS:
+            if self.on_select:
+                self.on_select(path)
+
+    def _navigate(self, path):
+        candidate = Path(os.path.expandvars(os.path.expanduser(str(path))))
+        if candidate.is_dir():
+            self.current_dir = candidate.resolve()
+            self._refresh()
+        else:
+            messagebox.showwarning(
+                'Folder not found',
+                f'This folder does not exist:\n{candidate}',
+            )
+
+    def _go_up(self):
+        parent = self.current_dir.parent
+        if parent != self.current_dir:
+            self._navigate(parent)
+
+    def _go_home(self):
+        self._navigate(Path.home())
+
+    def _go_click(self):
+        value = self.path_var.get().strip()
+        if value:
+            self._navigate(value)
+
+
+def read_tags(filepath: Path) -> dict:
+    """Return {'artist': str, 'album': str, 'format': str, 'tags': str}."""
+    info = {
+        "artist": "(none)",
+        "album": "(none)",
+        "format": filepath.suffix.lstrip("."),
+        "tags": "",
+    }
+
+    # MKV — mutagen doesn't support it; use ffprobe
+    if filepath.suffix.lower() == ".mkv":
+        meta = _read_mkv_tags(str(filepath))
+        if meta["artist"]:
+            info["artist"] = meta["artist"]
+        if meta["album"]:
+            info["album"] = meta["album"]
+        return info
+
+    try:
+        audio = mutagen_file(str(filepath))
+    except Exception:
+        return info
+
+    if audio is None:
+        return info
+
+    meta = _extract_metadata(audio)
+    if meta["artist"]:
+        info["artist"] = meta["artist"]
+    if meta["album"]:
+        info["album"] = meta["album"]
+
+    if hasattr(audio, "tags") and audio.tags:
+        keys = list(audio.tags.keys())
+        info["tags"] = ", ".join(str(k) for k in keys[:10])
+        if len(keys) > 10:
+            info["tags"] += f" (+{len(keys) - 10} more)"
+
+    return info
+
+
+def _extract_metadata(audio) -> dict:
+    """Extract artist and album from any mutagen-compatible audio object."""
+    result = {"artist": "", "album": ""}
+    if not hasattr(audio, "tags") or audio.tags is None:
+        return result
+
+    tags = audio.tags
+
+    # MP3 — ID3
+    for key in ("TPE1", "TOPE"):
+        if key in tags:
+            try:
+                result["artist"] = str(tags[key][0])
+            except Exception:
+                pass
+
+    # FLAC, OGG Vorbis, Opus
+    if not result["artist"]:
+        for key in ("artist", "ARTIST", "ALBUMARTIST", "ALBUM ARTIST"):
+            if key in tags:
+                try:
+                    val = tags[key]
+                    result["artist"] = str(val[0]) if isinstance(val, list) else str(val)
+                except Exception:
+                    pass
+                break
+
+    # M4A / MP4
+    if not result["artist"]:
+        for key in ("\xa9ART", "aART"):
+            if key in tags:
+                try:
+                    val = tags[key]
+                    if val and len(val) > 0:
+                        result["artist"] = str(val[0])
+                except Exception:
+                    pass
+
+    # WMA (ASF)
+    if not result["artist"]:
+        for key in ("Author", "Title", "Author\x00\x00"):
+            if key in tags:
+                try:
+                    val = tags[key]
+                    result["artist"] = str(val[0]) if isinstance(val, list) else str(val)
+                except Exception:
+                    pass
+                break
+
+    # WAV — ID3v2
+    if isinstance(audio, WAVE) and "ID3" in tags:
+        for key in ("TPE1", "TOPE"):
+            if key in tags["ID3"]:
+                try:
+                    result["artist"] = str(tags["ID3"][key][0])
+                except Exception:
+                    pass
+
+    # Album
+    for key in ("TIT2",):
+        if key in tags:
+            try:
+                result["album"] = str(tags[key][0])
+            except Exception:
+                pass
+
+    if not result["album"]:
+        for key in ("album", "ALBUM"):
+            if key in tags:
+                try:
+                    val = tags[key]
+                    result["album"] = str(val[0]) if isinstance(val, list) else str(val)
+                except Exception:
+                    pass
+
+    if not result["album"] and isinstance(audio, MP4):
+        for key in ("\xa9alb",):
+            if key in tags:
+                try:
+                    val = tags[key]
+                    if val and len(val) > 0:
+                        result["album"] = str(val[0])
+                except Exception:
+                    pass
+
+    if not result["album"] and isinstance(audio, ASF):
+        for key in ("WM/AlbumTitle", "Album"):
+            if key in tags:
+                try:
+                    val = tags[key]
+                    result["album"] = str(val[0]) if isinstance(val, list) else str(val)
+                except Exception:
+                    pass
+
+    return result
+
+
+def write_tags(filepath: Path, artist: str, album: str) -> str:
+    """Write artist and album tags to a single file. Returns status string."""
+    # MKV — mutagen doesn't support it; use ffmpeg
+    if filepath.suffix.lower() == ".mkv":
+        return _write_mkv_tags(str(filepath), artist, album)
+
+    try:
+        audio = mutagen_file(str(filepath))
+    except Exception as e:
+        return f"Error: {e}"
+
+    if audio is None:
+        return "Unsupported"
+
+    if not hasattr(audio, "tags") or audio.tags is None:
+        return "No tags"
+
+    success = False
+    wrote_artist = False
+    wrote_album = False
+
+    if isinstance(audio, MP3):
+        if artist:
+            audio.tags.add(TPE1(encoding=3, text=artist))
+            wrote_artist = True
+        if album:
+            audio.tags.add(TIT2(encoding=3, text=album))
+            wrote_album = True
+        success = wrote_artist or wrote_album
+
+    elif isinstance(audio, FLAC):
+        if artist:
+            audio.tags["artist"] = artist
+            wrote_artist = True
+        if album:
+            audio.tags["album"] = album
+            wrote_album = True
+        success = wrote_artist or wrote_album
+
+    elif isinstance(audio, OggVorbis):
+        if artist:
+            audio.tags["artist"] = artist
+            wrote_artist = True
+        if album:
+            audio.tags["album"] = album
+            wrote_album = True
+        success = wrote_artist or wrote_album
+
+    elif isinstance(audio, MP4):
+        if artist:
+            audio.tags["\xa9ART"] = [artist]
+            wrote_artist = True
+        if album:
+            audio.tags["\xa9alb"] = [album]
+            wrote_album = True
+        success = wrote_artist or wrote_album
+
+    elif isinstance(audio, ASF):
+        if artist:
+            audio.tags["Author"] = artist
+            wrote_artist = True
+        if album:
+            audio.tags["WM/AlbumTitle"] = album
+            wrote_album = True
+        success = wrote_artist or wrote_album
+
+    elif isinstance(audio, WAVE):
+        if "ID3" in audio.tags:
+            if artist:
+                audio.tags["ID3"].add(TPE1(encoding=3, text=artist))
+                wrote_artist = True
+            if album:
+                audio.tags["ID3"].add(TIT2(encoding=3, text=album))
+                wrote_album = True
+            success = wrote_artist or wrote_album
+        else:
+            return "No ID3 in WAV"
+
+    if success:
+        audio.save()
+
+    return "OK"
+
+
+class ArtistEditorApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("Artist Metadata Editor")
+        self.root.geometry("900x750")
+        self.root.minsize(700, 500)
+        self.folder_path: Path = Path()
+        self.audio_files: list[Path] = []
+
+        self._build_ui()
+
+    # ── UI Layout ──────────────────────────────────────────────
+
+    def _build_ui(self):
+        pad = {"padx": 10, "pady": 6}
+
+        # Title
+        ttk.Label(self.root, text="Artist Metadata Editor",
+                  font=('TkDefaultFont', 16, 'bold')).pack(pady=(8, 0))
+
+        # ── Browser ──
+        self.browser = FileBrowserPanel(
+            self.root,
+            on_select=self._on_folder_select,
+        )
+        self.browser.pack(fill='both', expand=False, padx=10, pady=6)
+
+        # ── Scan + Artist edit area ──
+        top_row = ttk.Frame(self.root)
+        top_row.pack(fill='x', **pad)
+
+        ttk.Button(top_row, text="📂 Scan This Folder",
+                   command=self._scan_current_browser_folder).pack(
+            side="left", padx=(0, 6))
+
+        art = ttk.Frame(top_row)
+        art.pack(fill='x', expand=True)
+
+        # Artist row
+        art_row = ttk.Frame(art)
+        art_row.pack(fill='x')
+        ttk.Label(art_row, text="Artist:").pack(side="left")
+        self.artist_var = tk.StringVar(value="")
+        self.artist_entry = ttk.Entry(art_row, textvariable=self.artist_var, width=40)
+        self.artist_entry.pack(side="left", padx=(6, 0), fill="x", expand=True)
+        self.artist_entry.bind("<Return>", self._apply)
+
+        # Album row
+        art_row2 = ttk.Frame(art)
+        art_row2.pack(fill='x')
+        ttk.Label(art_row2, text="Album:").pack(side="left")
+        self.album_var = tk.StringVar(value="")
+        self.album_entry = ttk.Entry(art_row2, textvariable=self.album_var, width=40)
+        self.album_entry.pack(side="left", padx=(6, 0), fill="x", expand=True)
+        self.album_entry.bind("<Return>", self._apply)
+
+        ttk.Button(art_row2, text="Apply to Selected",
+                   command=lambda: self._apply()).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(art_row2, text="Apply to All",
+                   command=self._apply_all).pack(side="left", padx=(6, 0))
+
+        # Status / progress
+        self.status_var = tk.StringVar(
+            value="Navigate in the browser, then click 'Scan This Folder'"
+        )
+        ttk.Label(self.root, textvariable=self.status_var,
+                  foreground="gray").pack(side="bottom", fill="x",
+                                          padx=10, pady=(0, 4))
+
+        # ── Audio file tree ──
+        tree_frame = ttk.Frame(self.root)
+        tree_frame.pack(fill='both', expand=True, padx=10, pady=(0, 6))
+
+        tree_cols = ("file", "artist", "album", "format", "tags")
+        self.tree = ttk.Treeview(tree_frame, columns=tree_cols, show="headings",
+                                 selectmode="extended")
+        headings = {"file": "File", "artist": "Artist", "album": "Album",
+                    "format": "Format", "tags": "Tags"}
+        widths = {"file": 250, "artist": 130, "album": 140,
+                  "format": 55, "tags": 230}
+        for col in tree_cols:
+            self.tree.heading(col, text=headings[col])
+            self.tree.column(col, width=widths[col])
+
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical",
+                                  command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        self.tree.bind("<Double-1>", self._double_click)
+
+    # ── Scan ───────────────────────────────────────────────────
+
+    def _scan_current_browser_folder(self):
+        """Scan the folder currently displayed in the browser."""
+        folder = self.browser.current_dir.resolve()
+        if not folder.is_dir():
+            messagebox.showwarning("Not a folder", f"Not a folder: {folder}")
+            return
+        self._scan_folder(folder)
+
+    def _on_folder_select(self, path: Path):
+        """Called when user double-clicks a folder in the browser."""
+        pass
+
+    def _scan_folder(self, folder: Path):
+        """Scan a folder for files and populate the tree."""
+        self.folder_path = folder.resolve()
+        self.status_var.set(f"Scanning: {self.folder_path}")
+        self.root.update()
+
+        # Auto-suggest artist and album from folder name
+        folder_name = self.folder_path.name
+        self.artist_var.set(guess_artist(folder_name))
+        self.album_var.set(guess_album(folder_name))
+
+        self.audio_files = []
+        for root_dir, dirs, files in os.walk(self.folder_path):
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            for f in files:
+                ext = os.path.splitext(f)[1].lower()
+                if ext in AUDIO_EXTENSIONS:
+                    self.audio_files.append(Path(root_dir) / f)
+
+        self._populate_tree(self.audio_files)
+        self.status_var.set(f"{len(self.audio_files)} file(s) found")
+
+    # ── Tree Population ────────────────────────────────────────
+
+    def _populate_tree(self, files: list[Path]):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for fp in files:
+            info = read_tags(fp)
+            rel = fp.relative_to(self.folder_path)
+            self.tree.insert("", "end", values=(
+                str(rel),
+                info["artist"],
+                info["album"],
+                info["format"],
+                info["tags"],
+            ))
+
+    # ── Writing Tags ───────────────────────────────────────────
+
+    def _apply_to_file(self, filepath: Path, artist: str, album: str = "") -> str:
+        """Write artist and album tags to a single file."""
+        return write_tags(filepath, artist, album)
+
+    # ── Apply Actions ──────────────────────────────────────────
+
+    def _apply(self):
+        """Apply to currently selected rows (or all if nothing selected)."""
+        artist = self.artist_var.get().strip()
+        album = self.album_var.get().strip()
+        if not artist and not album:
+            messagebox.showwarning("No data", "Please enter an artist or album name.")
+            return
+        if not self.audio_files:
+            messagebox.showwarning("No files",
+                                   "No files found. Select a folder first.")
+            return
+
+        selected = self.tree.selection()
+        if selected:
+            indices = [self.tree.index(item) for item in selected]
+            targets = [self.audio_files[i] for i in indices]
+        else:
+            targets = self.audio_files
+        self._write_batch(targets, artist, album, "selected")
+
+    def _apply_all(self):
+        artist = self.artist_var.get().strip()
+        album = self.album_var.get().strip()
+        if not artist and not album:
+            messagebox.showwarning("No data", "Please enter an artist or album name.")
+            return
+        if not self.audio_files:
+            messagebox.showwarning("No files", "No files found.")
+            return
+        self._write_batch(self.audio_files, artist, album, "all")
+
+    def _write_batch(self, targets: list[Path], artist: str, album: str, scope: str):
+        total = len(targets)
+        ok = 0
+        errs = 0
+        last_error = ""
+        self.status_var.set(f"Applying to {total} {scope} file(s)…")
+        self.root.update()
+
+        for fp in targets:
+            result = self._apply_to_file(fp, artist, album)
+            rel = fp.relative_to(self.folder_path)
+            if result == "OK":
+                ok += 1
+                self.status_var.set(f"OK: {rel}")
+            else:
+                errs += 1
+                last_error = result
+                self.status_var.set(f"Error on {rel}: {result}")
+            self.root.update()
+            if errs >= 10:
+                break
+
+        self._populate_tree(self.audio_files)
+        if errs > 0:
+            detail = f"\nLast error: {last_error}"
+        else:
+            detail = ""
+        msg = f"Done. {ok} OK, {errs} error(s)."
+        self.status_var.set(msg)
+        messagebox.showinfo("Complete", msg + detail)
+
+    def _double_click(self, event):
+        """Double-click a row to edit just that file's artist or album."""
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return
+        col = self.tree.identify_column(event.x)
+        idx = self.tree.index(item)
+        values = self.tree.item(item, "values")
+
+        if col == "#2":  # Artist column
+            current = values[1]
+            new = tk.simpledialog.askstring("Edit Artist", "Enter artist name:",
+                                            initialvalue=current)
+            if new and new.strip():
+                self._apply_to_file(self.audio_files[idx], new.strip())
+        elif col == "#3":  # Album column
+            current = values[2]
+            new = tk.simpledialog.askstring("Edit Album", "Enter album name:",
+                                            initialvalue=current)
+            if new and new.strip():
+                self._apply_to_file(self.audio_files[idx], album=new.strip())
+        else:
+            return
+
+        self._populate_tree(self.audio_files)
+        field = "artist" if col == "#2" else "album"
+        self.status_var.set(f"Updated {field}: {self.audio_files[idx].name}")
+
+
+def main():
+    root = tk.Tk()
+    ArtistEditorApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
