@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-TOOLS=(video-cutter video-joiner video-resizer video-speeder)
+TOOLS=(video-cutter video-joiner video-meta video-resizer video-speeder)
 
 # Check that all tools exist
 missing=()
@@ -35,7 +35,7 @@ read -rp "  → " choice
 echo ""
 
 case "$choice" in
-  [1-4])
+  [1-5])
     echo "Launching ${TOOLS[$((choice-1))]}…"
     exec "$SCRIPT_DIR/${TOOLS[$((choice-1))]}"
     ;;
