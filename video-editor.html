@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Simple Video Editor</title>
+    <style>
+        body { background: #111827; color: white; font-family: sans-serif; margin: 0; padding: 20px; text-align: center; }
+        #uploadSection { background: #374151; border: 2px dashed #4b5563; padding: 3rem; cursor: pointer; margin: 2rem auto; max-width: 600px; border-radius: 8px; }
+        #uploadSection:hover { border-color: #3b82f6; }
+        #editorSection { display: none; max-width: 800px; margin: 0 auto; text-align: left; }
+        video { width: 100%; background: black; border-radius: 8px; margin-bottom: 1rem; }
+        #timeline { height: 40px; background: #374151; margin: 10px 0; position: relative; cursor: pointer; border-radius: 4px; overflow: hidden; }
+        #progressBar { height: 100%; background: #3b82f6; width: 0%; pointer-events: none; }
+        .cutMark { position: absolute; top: 0; height: 100%; background: rgba(220,38,38,0.55); pointer-events: none; }
+        button { padding: 10px 20px; background: #2563eb; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 1rem; }
+        button:disabled { opacity: 0.5; background: #4b5563; cursor: default; }
+        .danger-btn { background: #dc2626; }
+        pre { background: #1f2937; padding: 1rem; border-radius: 4px; white-space: pre-wrap; word-break: break-all; color: #10b981; border: 1px solid #374151; margin-bottom: 20px; font-size: 0.85rem; }
+        .segment-item { background: #1f2937; padding: 10px; margin-bottom: 8px; border-radius: 4px; border-left: 4px solid #dc2626; display: flex; justify-content: space-between; align-items: center; }
+    </style>
+</head>
+<body>
+    <div id="uploadSection">
+        <h1>Upload Video File</h1>
+        <p style="color: #9ca3af;">Click to select MP4 or WebM (MKV only plays if your browser supports its codecs)</p>
+    </div>
+    <input type="file" id="videoInput" accept="video/*" style="display:none">
+
+    <div id="editorSection">
+        <video id="player" controls></video>
+        <div id="timeline"><div id="progressBar"></div></div>
+        <div style="text-align: center; margin: 20px 0;">
+            <button id="markStart">Mark Start</button>
+            <button id="markEnd" disabled>Mark End</button>
+            <span id="time" style="margin-left: 15px; color: #9ca3af; font-family: monospace;">0:00 / 0:00</span>
+        </div>
+        <p style="font-size: 0.85rem; color: #9ca3af;">Marked sections (red) are <b>cut out</b>. Everything else is kept.</p>
+        <div id="list"></div>
+        <h3>FFmpeg Commands</h3>
+        <p style="font-size: 0.8rem; color: #9ca3af;">Re-encodes (H.264 + AAC) so cuts are frame-accurate. Run in the folder containing the original video.</p>
+        <pre id="cmdOutput">Select segments to generate commands...</pre>
+        <button id="copyBtn">📋 Copy Commands</button>
+    </div>
+
+<script>
+    const $ = id => document.getElementById(id);
+    let file, duration = 0, current = 0, sections = [], start = null;
+
+    $('uploadSection').onclick = () => $('videoInput').click();
+
+    $('videoInput').onchange = e => {
+        file = e.target.files[0];
+        if (!file) return;
+        $('player').src = URL.createObjectURL(file);
+        $('uploadSection').style.display = 'none';
+        $('editorSection').style.display = 'block';
+        $('cmdOutput').innerText = "Play video and mark sections to cut out...";
+    };
+
+    $('player').onloadedmetadata = () => {
+        duration = isFinite($('player').duration) ? $('player').duration : 0;
+    };
+    $('player').ondurationchange = $('player').onloadedmetadata;
+
+    $('player').ontimeupdate = () => {
+        current = $('player').currentTime;
+        if (duration) {
+            $('time').innerText = `${format(current)} / ${format(duration)}`;
+            $('progressBar').style.width = `${(current / duration) * 100}%`;
+        }
+    };
+
+    $('timeline').onclick = e => {
+        if (!duration) return;
+        const rect = $('timeline').getBoundingClientRect();
+        const pos = Math.min(Math.max((e.clientX - rect.left) / rect.width, 0), 1);
+        $('player').currentTime = pos * duration;
+    };
+
+    function format(s) {
+        if (!s) return "0:00";
+        const m = Math.floor(s / 60), sec = Math.floor(s % 60);
+        return `${m}:${sec.toString().padStart(2, '0')}`;
+    }
+
+    $('markStart').onclick = () => {
+        start = $('player').currentTime;
+        $('markEnd').disabled = false;
+        $('markStart').innerText = `Start: ${format(start)}`;
+        $('markStart').style.background = "#10b981";
+    };
+
+    $('markEnd').onclick = () => {
+        const end = $('player').currentTime;
+        if (start !== null && end > start) {
+            sections.push({ s: start, e: end, id: Date.now() });
+            start = null;
+            $('markEnd').disabled = true;
+            $('markStart').innerText = "Mark Start";
+            $('markStart').style.background = "#2563eb";
+            renderList();
+        }
+    };
+
+    window.del = id => { sections = sections.filter(x => x.id !== id); renderList(); };
+
+    function renderList() {
+        const l = $('list');
+        l.innerHTML = '';
+        sections.forEach(x => {
+            const d = document.createElement('div');
+            d.className = 'segment-item';
+            d.innerHTML = `<span>Cut out: ${format(x.s)} - ${format(x.e)}</span> <button onclick="del(${x.id})" class="danger-btn" style="padding: 5px 10px;">Remove</button>`;
+            l.appendChild(d);
+        });
+        // draw red marks on the timeline
+        document.querySelectorAll('.cutMark').forEach(n => n.remove());
+        if (duration) sections.forEach(x => {
+            const m = document.createElement('div');
+            m.className = 'cutMark';
+            m.style.left = `${(x.s / duration) * 100}%`;
+            m.style.width = `${((x.e - x.s) / duration) * 100}%`;
+            $('timeline').appendChild(m);
+        });
+        generateCmd();
+    }
+
+    // Single-quote a string for the shell
+    const shq = s => `'${s.replace(/'/g, `'\\''`)}'`;
+
+    function generateCmd() {
+        if (sections.length === 0) { $('cmdOutput').innerText = "No segments selected."; return; }
+        if (!duration) { $('cmdOutput').innerText = "Video duration unknown (browser couldn't read it)."; return; }
+
+        // Merge overlapping cuts
+        const sorted = [...sections].sort((a, b) => a.s - b.s);
+        const cuts = [];
+        sorted.forEach(x => {
+            const l = cuts[cuts.length - 1];
+            if (l && x.s <= l.e) l.e = Math.max(l.e, x.e);
+            else cuts.push({ s: x.s, e: x.e });
+        });
+
+        // Invert: what we keep
+        const keeps = [];
+        let last = 0;
+        cuts.forEach(c => { if (c.s - last > 0.05) keeps.push({ s: last, e: c.s }); last = c.e; });
+        if (duration - last > 0.05) keeps.push({ s: last, e: duration });
+
+        if (keeps.length === 0) { $('cmdOutput').innerText = "Everything is marked for removal."; return; }
+
+        const enc = "-c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 192k";
+        const input = shq(file.name);
+        const outName = file.name.replace(/\.[^.]+$/, '') + "_DONE.mp4";
+        const cmds = [];
+
+        if (keeps.length === 1) {
+            const k = keeps[0];
+            cmds.push(`ffmpeg -y -ss ${k.s.toFixed(2)} -i ${input} -t ${(k.e - k.s).toFixed(2)} ${enc} ${shq(outName)}`);
+        } else {
+            keeps.forEach((k, i) => cmds.push(`ffmpeg -y -ss ${k.s.toFixed(2)} -i ${input} -t ${(k.e - k.s).toFixed(2)} ${enc} tmp_${i}.mp4`));
+            cmds.push(`printf "${keeps.map((_, i) => `file 'tmp_${i}.mp4'`).join('\\n')}\\n" > list.txt`);
+            cmds.push(`ffmpeg -y -f concat -safe 0 -i list.txt -c copy ${shq(outName)}`);
+            cmds.push(`rm tmp_*.mp4 list.txt`);
+        }
+        $('cmdOutput').innerText = cmds.join('\n');
+    }
+
+    $('copyBtn').onclick = () => {
+        const txt = $('cmdOutput').innerText;
+        if (!txt.startsWith('ffmpeg') ) return;
+        navigator.clipboard.writeText(txt).then(() => {
+            $('copyBtn').innerText = '✅ Copied!';
+            setTimeout(() => $('copyBtn').innerText = '📋 Copy Commands', 1500);
+        });
+    };
+</script>
+</body>
+</html>
